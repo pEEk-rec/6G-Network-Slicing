@@ -1,0 +1,22 @@
+# Virtual environments
+venv/
+.venv/
+6g/
+6g_env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# VSCode settings
+.vscode/
+
+# Dataset folders (if large)
+Dataset/
+*.csv
+*.npy
+*.pt
+
+# OS files
+.DS_Store
+Thumbs.db
