@@ -64,8 +64,9 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, nu
         predictions = model(X_batch)
         loss = criterion(predictions, y_batch)
         
-        # Backward pass
+        # Backward pass with gradient clipping
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
         optimizer.step()
         
         # Update metrics
@@ -130,8 +131,8 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed(config.RANDOM_SEED)
     
-    # Create dataloaders
-    train_loader, val_loader, test_loader = get_dataloaders(config)
+    # Create dataloaders with target scaler
+    train_loader, val_loader, test_loader, target_scaler = get_dataloaders(config)
     
     # Initialize model
     print("\n" + "-" * 80)
@@ -190,6 +191,7 @@ def main():
     print(f"  - URLLC weight: {config.LOSS_WEIGHTS[1].item():.1f} (prioritized)")
     print(f"  - mMTC weight: {config.LOSS_WEIGHTS[2].item():.1f}")
     print(f"LR scheduler: ReduceLROnPlateau (factor=0.5, patience=5)")
+    print(f"Gradient clipping: max_norm=1.0")
     print(f"Random seed: {config.RANDOM_SEED}")
     
     print("\n" + "-" * 80)
@@ -251,26 +253,24 @@ def main():
                           best_model_path)
             print(f"  >> Best model saved! (val_loss: {val_loss:.4f})")
         
-        # Evaluate with all metrics every 5 epochs
+        # Evaluate with all metrics every 5 epochs (with denormalization)
         if epoch % 5 == 0 or epoch == config.NUM_EPOCHS:
             print("\n" + "-" * 80)
             print(f"DETAILED EVALUATION - Epoch [{epoch}/{config.NUM_EPOCHS}]")
             print("-" * 80)
             
-            # Evaluate on validation set
-            val_metrics = evaluate_model(model, val_loader, config.DEVICE)
+            # Evaluate on validation set with denormalization
+            val_metrics = evaluate_model(model, val_loader, config.DEVICE, target_scaler)
             print_metrics(val_metrics, title="Validation Set Metrics")
-        
-        # Save checkpoint every 10 epochs
-        if epoch % 10 == 0:
-            checkpoint_path = os.path.join(config.MODEL_SAVE_DIR, 
-                                          f"checkpoint_epoch_{epoch}.pth")
-            save_checkpoint(model, optimizer, epoch, train_loss, val_loss, 
-                          checkpoint_path)
         
         print("-" * 80)
     
     total_time = time.time() - start_time
+    
+    # Save final checkpoint
+    final_checkpoint_path = os.path.join(config.MODEL_SAVE_DIR, "final_model.pth")
+    save_checkpoint(model, optimizer, config.NUM_EPOCHS, train_losses[-1], val_losses[-1], 
+                    final_checkpoint_path)
     
     # Final summary
     print("\n" + "=" * 80)
@@ -291,21 +291,24 @@ def main():
     checkpoint = torch.load(os.path.join(config.MODEL_SAVE_DIR, config.MODEL_NAME))
     model.load_state_dict(checkpoint['model_state_dict'])
     
-    # Evaluate on all splits
+    # Evaluate on all splits (with denormalization for interpretable metrics)
     print("\n>>> TRAINING SET:")
-    train_metrics = evaluate_model(model, train_loader, config.DEVICE)
+    train_metrics = evaluate_model(model, train_loader, config.DEVICE, target_scaler)
     print_metrics(train_metrics, title="Training Set - Final Metrics")
     
     print("\n>>> VALIDATION SET:")
-    val_metrics = evaluate_model(model, val_loader, config.DEVICE)
+    val_metrics = evaluate_model(model, val_loader, config.DEVICE, target_scaler)
     print_metrics(val_metrics, title="Validation Set - Final Metrics")
     
     print("\n>>> TEST SET:")
-    test_metrics = evaluate_model(model, test_loader, config.DEVICE)
+    test_metrics = evaluate_model(model, test_loader, config.DEVICE, target_scaler)
     print_metrics(test_metrics, title="Test Set - Final Metrics")
     
     print("\n" + "=" * 80)
-    print(f"Best model saved at: {os.path.join(config.MODEL_SAVE_DIR, config.MODEL_NAME)}")
+    print("SAVED MODELS:")
+    print("-" * 80)
+    print(f"Best model:  {os.path.join(config.MODEL_SAVE_DIR, config.MODEL_NAME)}")
+    print(f"Final model: {final_checkpoint_path}")
     print("=" * 80 + "\n")
 
 

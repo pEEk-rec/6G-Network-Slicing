@@ -5,6 +5,25 @@ Evaluation metrics for 6G Bandwidth Allocation
 import torch
 import numpy as np
 
+def denormalize_predictions(predictions, targets, scaler):
+    """
+    Denormalize predictions and targets back to original scale
+    
+    Args:
+        predictions: (N, 3) normalized tensor
+        targets: (N, 3) normalized tensor
+        scaler: StandardScaler used for normalization
+    
+    Returns:
+        tuple: (denorm_predictions, denorm_targets) in original Mbps scale
+    """
+    pred_numpy = predictions.cpu().numpy()
+    target_numpy = targets.cpu().numpy()
+    
+    pred_denorm = scaler.inverse_transform(pred_numpy)
+    target_denorm = scaler.inverse_transform(target_numpy)
+    
+    return torch.FloatTensor(pred_denorm), torch.FloatTensor(target_denorm)
 
 def calculate_mae(predictions, targets):
     """Mean Absolute Error per slice"""
@@ -67,9 +86,12 @@ def calculate_r2_score(predictions, targets):
     }
 
 
-def evaluate_model(model, dataloader, device):
+def evaluate_model(model, dataloader, device, target_scaler=None):
     """
     Comprehensive evaluation with all metrics
+    
+    Args:
+        target_scaler: If provided, denormalize predictions for interpretable metrics
     
     Returns:
         dict: All evaluation metrics
@@ -91,7 +113,13 @@ def evaluate_model(model, dataloader, device):
     all_predictions = torch.cat(all_predictions, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
     
-    # Calculate all metrics
+    # Denormalize if scaler provided
+    if target_scaler is not None:
+        all_predictions, all_targets = denormalize_predictions(
+            all_predictions, all_targets, target_scaler
+        )
+    
+    # Calculate all metrics (now in Mbps scale)
     metrics = {}
     metrics.update(calculate_mae(all_predictions, all_targets))
     metrics.update(calculate_mse(all_predictions, all_targets))
