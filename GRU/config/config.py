@@ -25,7 +25,7 @@ DROPOUT = 0.2            # Dropout rate for regularization
 
 # ===== TRAINING HYPERPARAMETERS =====
 BATCH_SIZE = 64          # Number of sequences per batch
-LEARNING_RATE = 0.001    # Adam optimizer learning rate
+LEARNING_RATE = 0.0001    # Adam optimizer learning rate
 NUM_EPOCHS = 50          # Maximum training epochs
 RANDOM_SEED = 42         # For reproducibility
 
