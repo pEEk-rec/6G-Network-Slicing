@@ -17,9 +17,9 @@ Y_TEST_PATH = os.path.join(DATA_DIR, "y_test_lstm.npy")
 
 # ===== MODEL ARCHITECTURE =====
 INPUT_SIZE = 17          # 17 features per timestep
-HIDDEN_SIZE_1 = 64       # First GRU layer
-HIDDEN_SIZE_2 = 32       # Second GRU layer
-DENSE_SIZE = 16          # Dense layer
+HIDDEN_SIZE_1 = 128       # First GRU layer
+HIDDEN_SIZE_2 = 64      # Second GRU layer
+DENSE_SIZE = 32       # Dense layer
 OUTPUT_SIZE = 3          # 3 bandwidth predictions (eMBB, URLLC, mMTC)
 DROPOUT = 0.2            # Dropout rate for regularization
 

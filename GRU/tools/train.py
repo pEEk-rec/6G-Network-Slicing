@@ -166,7 +166,12 @@ def main():
         return weighted_losses.mean()
     
     # Define optimizer
-    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+    optimizer = optim.AdamW(
+    model.parameters(), 
+    lr=config.LEARNING_RATE,
+    weight_decay=1e-4  # L2 regularization
+)
+
     
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
