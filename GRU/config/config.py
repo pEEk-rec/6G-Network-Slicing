@@ -41,7 +41,7 @@ MODEL_NAME = "bandwidth_gru_best.pth"
 os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
 
 # ===== LOSS WEIGHTS (for prioritizing URLLC) =====
-LOSS_WEIGHTS = torch.tensor([1.0, 5.0, 1.0]).to(DEVICE)  # [eMBB, URLLC, mMTC]
+LOSS_WEIGHTS = torch.tensor([2.5, 5.0, 1.0]).to(DEVICE)  # [eMBB, URLLC, mMTC]
 
 # ===== PRINT CONFIGURATION =====
 print("=" * 60)
