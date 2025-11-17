@@ -1,11 +1,14 @@
 """
 Custom Dataset and DataLoader for 6G Bandwidth Allocation
-Loads .npy sequence files and creates PyTorch DataLoaders
+Loads .npy sequence files and creates PyTorch DataLoaders with target normalization
 """
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+import joblib
+import os
 
 
 class BandwidthDataset(Dataset):
@@ -15,9 +18,11 @@ class BandwidthDataset(Dataset):
     Args:
         X_path (str): Path to input sequences .npy file
         y_path (str): Path to target values .npy file
+        y_scaler (StandardScaler, optional): Pre-fitted scaler for targets
+        fit_scaler (bool): If True, fit a new scaler on this data
     """
     
-    def __init__(self, X_path, y_path):
+    def __init__(self, X_path, y_path, y_scaler=None, fit_scaler=False):
         """
         Initialize dataset by loading .npy files
         """
@@ -32,6 +37,24 @@ class BandwidthDataset(Dataset):
         print(f"✓ Loaded data from {X_path}")
         print(f"  - X shape: {self.X.shape}")
         print(f"  - y shape: {self.y.shape}")
+        
+        # Handle target normalization
+        if fit_scaler:
+            # Fit new scaler on training data
+            self.y_scaler = StandardScaler()
+            self.y = self.y_scaler.fit_transform(self.y)
+            print(f"  - y scaler fitted (NEW)")
+            print(f"    Mean: {self.y_scaler.mean_}")
+            print(f"    Std:  {self.y_scaler.scale_}")
+        elif y_scaler is not None:
+            # Use existing scaler (for val/test)
+            self.y_scaler = y_scaler
+            self.y = self.y_scaler.transform(self.y)
+            print(f"  - y normalized (using train scaler)")
+        else:
+            # No normalization
+            self.y_scaler = None
+            print(f"  - y NOT normalized (WARNING: may cause training issues!)")
     
     def __len__(self):
         """
@@ -58,25 +81,54 @@ class BandwidthDataset(Dataset):
 
 def get_dataloaders(config):
     """
-    Create train, validation, and test DataLoaders
+    Create train, validation, and test DataLoaders with proper target normalization
     
     Args:
         config: Configuration module with paths and hyperparameters
     
     Returns:
-        tuple: (train_loader, val_loader, test_loader)
+        tuple: (train_loader, val_loader, test_loader, target_scaler)
     """
     
-    print("=" * 60)
-    print("CREATING DATALOADERS")
-    print("=" * 60)
+    print("=" * 80)
+    print("CREATING DATALOADERS WITH TARGET NORMALIZATION")
+    print("=" * 80)
     
-    # Create datasets
-    train_dataset = BandwidthDataset(config.X_TRAIN_PATH, config.Y_TRAIN_PATH)
-    val_dataset = BandwidthDataset(config.X_VAL_PATH, config.Y_VAL_PATH)
-    test_dataset = BandwidthDataset(config.X_TEST_PATH, config.Y_TEST_PATH)
+    # Create train dataset and FIT scaler on training targets
+    print("\n[1/3] Loading Training Data...")
+    train_dataset = BandwidthDataset(
+        config.X_TRAIN_PATH, 
+        config.Y_TRAIN_PATH,
+        fit_scaler=True  # Fit scaler on training data
+    )
+    
+    # Create val dataset using TRAIN scaler (prevent data leakage)
+    print("\n[2/3] Loading Validation Data...")
+    val_dataset = BandwidthDataset(
+        config.X_VAL_PATH, 
+        config.Y_VAL_PATH,
+        y_scaler=train_dataset.y_scaler  # Use train scaler
+    )
+    
+    # Create test dataset using TRAIN scaler
+    print("\n[3/3] Loading Test Data...")
+    test_dataset = BandwidthDataset(
+        config.X_TEST_PATH, 
+        config.Y_TEST_PATH,
+        y_scaler=train_dataset.y_scaler  # Use train scaler
+    )
+    
+    # Save target scaler for inference
+    scaler_save_path = os.path.join(os.path.dirname(config.X_TRAIN_PATH), 
+                                    "target_scaler.pkl")
+    joblib.dump(train_dataset.y_scaler, scaler_save_path)
+    print(f"\n✓ Target scaler saved: {scaler_save_path}")
     
     # Create DataLoaders
+    print("\n" + "=" * 80)
+    print("CREATING DATALOADERS")
+    print("=" * 80)
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.BATCH_SIZE,
@@ -102,9 +154,9 @@ def get_dataloaders(config):
     )
     
     print(f"\n✓ DataLoaders created successfully!")
-    print(f"  - Train batches: {len(train_loader)}")
-    print(f"  - Val batches: {len(val_loader)}")
-    print(f"  - Test batches: {len(test_loader)}")
-    print("=" * 60)
+    print(f"  - Train: {len(train_loader.dataset):,} samples, {len(train_loader)} batches")
+    print(f"  - Val:   {len(val_loader.dataset):,} samples, {len(val_loader)} batches")
+    print(f"  - Test:  {len(test_loader.dataset):,} samples, {len(test_loader)} batches")
+    print("=" * 80)
     
-    return train_loader, val_loader, test_loader
+    return train_loader, val_loader, test_loader, train_dataset.y_scaler
