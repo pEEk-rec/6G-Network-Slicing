@@ -1,11 +1,53 @@
 """
-Create sequences from processed data for GRU training
-Converts per-timestep data → sliding window sequences
+Create sequences from processed data for GRU training - FIXED VERSION
+Updates: Uses new feature set, adds data validation
 """
 
 import pandas as pd
 import numpy as np
 import os
+
+
+def get_feature_columns():
+    """
+    MUST match features from preprocessing
+    """
+    base_features = [
+        # Temporal (3 features)
+        'time_hour_sin', 'time_hour_cos', 'is_peak_hour',
+        
+        # Network Load (3 features)
+        'network_utilization', 'total_active_users', 'load_per_user',
+        
+        # Per-Slice Demands (3 features)
+        'total_demand_embb', 'total_demand_urllc', 'total_demand_mmtc',
+        
+        # Demand Ratios (3 features)
+        'embb_demand_ratio', 'urllc_demand_ratio', 'mmtc_demand_ratio',
+        
+        # Per-Slice SINR (3 features)
+        'avg_sinr_embb', 'avg_sinr_urllc', 'avg_sinr_mmtc',
+        
+        # Per-Slice CQI (3 features)
+        'avg_cqi_embb', 'avg_cqi_urllc', 'avg_cqi_mmtc',
+        
+        # Channel Quality (3 features)
+        'embb_channel_quality', 'urllc_channel_quality', 'mmtc_channel_quality',
+        
+        # Slice Utilizations (3 features)
+        'embb_utilization', 'urllc_utilization', 'mmtc_utilization',
+        
+        # Utilization-Demand Ratios (3 features)
+        'embb_util_demand_ratio', 'urllc_util_demand_ratio', 'mmtc_util_demand_ratio',
+    ]
+    
+    # Temporal features (deltas + moving averages)
+    temporal_features = []
+    for col in ['total_demand_embb', 'total_demand_urllc', 'total_demand_mmtc',
+                'network_utilization', 'total_active_users']:
+        temporal_features.extend([f'{col}_delta', f'{col}_ma3'])
+    
+    return base_features + temporal_features
 
 
 def create_sequences_per_episode(df, sequence_length=10):
@@ -21,14 +63,7 @@ def create_sequences_per_episode(df, sequence_length=10):
         y: Target values (N, n_outputs)
     """
     
-    feature_cols = [
-        'timestamp', 'time_hour', 'is_peak_hour',
-        'network_utilization', 'total_active_users',
-        'total_demand_embb', 'total_demand_urllc', 'total_demand_mmtc',
-        'avg_sinr_embb', 'avg_sinr_urllc', 'avg_sinr_mmtc',
-        'avg_cqi_embb', 'avg_cqi_urllc', 'avg_cqi_mmtc',
-        'embb_utilization', 'urllc_utilization', 'mmtc_utilization'
-    ]
+    feature_cols = get_feature_columns()
     
     target_cols = [
         'allocated_bandwidth_mbps_embb',
@@ -36,21 +71,33 @@ def create_sequences_per_episode(df, sequence_length=10):
         'allocated_bandwidth_mbps_mmtc'
     ]
     
+    # Verify all features exist
+    missing_features = [col for col in feature_cols if col not in df.columns]
+    if missing_features:
+        raise ValueError(f"Missing features in dataframe: {missing_features}")
+    
+    print(f"Using {len(feature_cols)} features per timestep")
+    
     X_sequences = []
     y_targets = []
     
     # Process each episode independently
-    for episode_id in df['episode_id'].unique():
+    for episode_id in sorted(df['episode_id'].unique()):
         episode_df = df[df['episode_id'] == episode_id].sort_values('step_id')
         
         # Extract features and targets
-        features = episode_df[feature_cols].values  # (timesteps, 17)
+        features = episode_df[feature_cols].values  # (timesteps, n_features)
         targets = episode_df[target_cols].values    # (timesteps, 3)
+        
+        # Verify no NaN/Inf
+        if np.isnan(features).any() or np.isinf(features).any():
+            print(f"⚠ WARNING: Episode {episode_id} contains NaN/Inf in features")
+            continue
         
         # Create sliding windows
         for i in range(sequence_length, len(features)):
             # Input: past 'sequence_length' timesteps
-            X_seq = features[i - sequence_length:i]  # (10, 17)
+            X_seq = features[i - sequence_length:i]  # (seq_len, n_features)
             
             # Target: allocation at current timestep
             y_target = targets[i]  # (3,)
@@ -58,10 +105,39 @@ def create_sequences_per_episode(df, sequence_length=10):
             X_sequences.append(X_seq)
             y_targets.append(y_target)
     
-    X = np.array(X_sequences)  # (N, 10, 17)
-    y = np.array(y_targets)    # (N, 3)
+    X = np.array(X_sequences, dtype=np.float32)  # (N, seq_len, n_features)
+    y = np.array(y_targets, dtype=np.float32)    # (N, 3)
     
     return X, y
+
+
+def verify_sequences(X, y, split_name):
+    """
+    Verify sequence quality
+    """
+    print(f"\nVerifying {split_name} sequences:")
+    
+    # Check shapes
+    print(f"  X shape: {X.shape}")
+    print(f"  y shape: {y.shape}")
+    
+    # Check for NaN/Inf
+    nan_count_X = np.isnan(X).sum()
+    inf_count_X = np.isinf(X).sum()
+    nan_count_y = np.isnan(y).sum()
+    inf_count_y = np.isinf(y).sum()
+    
+    print(f"  X - NaN: {nan_count_X}, Inf: {inf_count_X}")
+    print(f"  y - NaN: {nan_count_y}, Inf: {inf_count_y}")
+    
+    if nan_count_X > 0 or inf_count_X > 0 or nan_count_y > 0 or inf_count_y > 0:
+        raise ValueError(f"⚠ ERROR: Found NaN/Inf in {split_name} sequences!")
+    
+    # Check value ranges
+    print(f"  X range: [{X.min():.2f}, {X.max():.2f}]")
+    print(f"  y range: [{y.min():.2f}, {y.max():.2f}]")
+    
+    print(f"  ✓ Quality check passed")
 
 
 def main():
@@ -69,12 +145,12 @@ def main():
     Generate sequences for all splits
     """
     print("\n" + "=" * 80)
-    print("SEQUENCE GENERATION FOR GRU")
+    print("SEQUENCE GENERATION FOR GRU - FIXED VERSION")
     print("=" * 80)
     
     # Paths
     data_dir = r"D:\Academics\SEM-5\Machine Learning\ML_courseproj\Processed"
-    output_dir = "D:/Academics/SEM-5/Machine Learning/ML_courseproj/SplitsMe"
+    output_dir = r"D:\Academics\SEM-5\Machine Learning\ML_courseproj\SplitsMe"
     os.makedirs(output_dir, exist_ok=True)
     
     # Sequence parameters
@@ -97,18 +173,15 @@ def main():
     
     print("\n[1/3] Training set...")
     X_train, y_train = create_sequences_per_episode(train_df, sequence_length)
-    print(f"  X_train: {X_train.shape}")
-    print(f"  y_train: {y_train.shape}")
+    verify_sequences(X_train, y_train, "Training")
     
     print("\n[2/3] Validation set...")
     X_val, y_val = create_sequences_per_episode(val_df, sequence_length)
-    print(f"  X_val:   {X_val.shape}")
-    print(f"  y_val:   {y_val.shape}")
+    verify_sequences(X_val, y_val, "Validation")
     
     print("\n[3/3] Test set...")
     X_test, y_test = create_sequences_per_episode(test_df, sequence_length)
-    print(f"  X_test:  {X_test.shape}")
-    print(f"  y_test:  {y_test.shape}")
+    verify_sequences(X_test, y_test, "Test")
     
     # Save sequences as .npy files
     print("\n" + "=" * 80)
@@ -135,9 +208,9 @@ def main():
     print("SEQUENCE GENERATION COMPLETE!")
     print("=" * 80)
     print(f"\nSequence format:")
-    print(f"  Input:  (batch, {sequence_length}, 17) - Past {sequence_length} timesteps with 17 features each")
+    print(f"  Input:  (batch, {sequence_length}, {X_train.shape[2]}) - Past {sequence_length} timesteps")
     print(f"  Output: (batch, 3) - Bandwidth allocation for 3 slices")
-    print("\nReady for GRU training!")
+    print(f"\n✓ Ready for GRU training with improved features!")
     print("=" * 80)
 
 

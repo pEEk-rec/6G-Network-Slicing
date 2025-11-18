@@ -1,6 +1,7 @@
 """
-Evaluation metrics for 6G Bandwidth Allocation
-Robust metrics without MAPE (removed due to slice-dependent instability)
+Evaluation metrics for 6G Bandwidth Allocation - STREAMLINED VERSION
+Focus: R² Score (model quality) and RMSE (prediction error in Mbps)
+Removed: Clutter metrics that don't drive optimization decisions
 """
 
 import torch
@@ -10,7 +11,7 @@ import numpy as np
 def denormalize_predictions(predictions, targets, scaler):
     """
     Denormalize predictions and targets back to original scale
-    Reverses: normalize → log → original Mbps values
+    Reverses: StandardScaler → log1p → original Mbps values
     
     Args:
         predictions: (N, 3) normalized tensor
@@ -31,13 +32,60 @@ def denormalize_predictions(predictions, targets, scaler):
     pred_denorm = np.expm1(pred_denorm)
     target_denorm = np.expm1(target_denorm)
     
+    # Clip negative values (shouldn't happen but safety check)
+    pred_denorm = np.maximum(pred_denorm, 0)
+    target_denorm = np.maximum(target_denorm, 0)
+    
     return torch.FloatTensor(pred_denorm), torch.FloatTensor(target_denorm)
+
+
+def calculate_rmse(predictions, targets):
+    """
+    Root Mean Squared Error per slice (in Mbps)
+    PRIMARY METRIC: Measures average prediction error magnitude
+    
+    Lower is better. Units: Mbps (interpretable)
+    """
+    mse = ((predictions - targets) ** 2).mean(dim=0)
+    rmse = torch.sqrt(mse)
+    
+    return {
+        'rmse_embb': rmse[0].item(),
+        'rmse_urllc': rmse[1].item(),
+        'rmse_mmtc': rmse[2].item(),
+        'rmse_overall': rmse.mean().item()
+    }
+
+
+def calculate_r2_score(predictions, targets):
+    """
+    R² Score (Coefficient of Determination)
+    PRIMARY METRIC: Measures model's explanatory power
+    
+    Interpretation:
+    - R² = 1.0: Perfect predictions
+    - R² = 0.8-1.0: Excellent model
+    - R² = 0.6-0.8: Good model
+    - R² = 0.4-0.6: Moderate model
+    - R² < 0.4: Poor model
+    - R² < 0: Worse than predicting mean (FAILURE)
+    """
+    ss_res = ((targets - predictions) ** 2).sum(dim=0)
+    ss_tot = ((targets - targets.mean(dim=0)) ** 2).sum(dim=0)
+    r2 = 1 - (ss_res / (ss_tot + 1e-8))
+    
+    return {
+        'r2_embb': r2[0].item(),
+        'r2_urllc': r2[1].item(),
+        'r2_mmtc': r2[2].item(),
+        'r2_overall': r2.mean().item()
+    }
 
 
 def calculate_mae(predictions, targets):
     """
     Mean Absolute Error per slice (in Mbps)
-    Lower is better. Interpretable: average error in Mbps
+    AUXILIARY METRIC: L1 distance, less sensitive to outliers than RMSE
     """
     mae = torch.abs(predictions - targets).mean(dim=0)
     return {
@@ -48,154 +96,43 @@ def calculate_mae(predictions, targets):
     }
 
 
-def calculate_mse(predictions, targets):
+def get_per_slice_loss(predictions, targets, loss_fn):
     """
-    Mean Squared Error per slice (Mbps²)
-    Penalizes large errors more heavily than MAE
-    """
-    mse = ((predictions - targets) ** 2).mean(dim=0)
-    return {
-        'mse_embb': mse[0].item(),
-        'mse_urllc': mse[1].item(),
-        'mse_mmtc': mse[2].item(),
-        'mse_overall': mse.mean().item()
-    }
-
-
-def calculate_rmse(predictions, targets):
-    """
-    Root Mean Squared Error per slice (in Mbps)
-    Same units as MAE but penalizes outliers more
-    """
-    mse = ((predictions - targets) ** 2).mean(dim=0)
-    rmse = torch.sqrt(mse)
-    return {
-        'rmse_embb': rmse[0].item(),
-        'rmse_urllc': rmse[1].item(),
-        'rmse_mmtc': rmse[2].item(),
-        'rmse_overall': rmse.mean().item()
-    }
-
-
-def calculate_nrmse(predictions, targets):
-    """
-    Normalized RMSE (percentage of mean target value)
-    Scale-independent metric: NRMSE = RMSE / mean(target) * 100
-    
-    Interpretation:
-    - NRMSE < 10%: Excellent
-    - NRMSE < 20%: Good
-    - NRMSE < 30%: Acceptable
-    - NRMSE > 30%: Poor
-    """
-    mse = ((predictions - targets) ** 2).mean(dim=0)
-    rmse = torch.sqrt(mse)
-    mean_targets = targets.mean(dim=0)
-    nrmse = (rmse / (mean_targets + 1e-8)) * 100
-    
-    return {
-        'nrmse_embb': nrmse[0].item(),
-        'nrmse_urllc': nrmse[1].item(),
-        'nrmse_mmtc': nrmse[2].item(),
-        'nrmse_overall': nrmse.mean().item()
-    }
-
-
-def calculate_r2_score(predictions, targets):
-    """
-    R² Score (Coefficient of Determination)
-    Measures how well predictions explain variance in targets
-    
-    Interpretation:
-    - R² = 1.0: Perfect predictions
-    - R² = 0.8-0.95: Excellent model
-    - R² = 0.6-0.8: Good model
-    - R² = 0.4-0.6: Moderate model
-    - R² < 0.4: Poor model
-    - R² < 0: Worse than predicting mean
-    """
-    ss_res = ((targets - predictions) ** 2).sum(dim=0)
-    ss_tot = ((targets - targets.mean(dim=0)) ** 2).sum(dim=0)
-    r2 = 1 - (ss_res / (ss_tot + 1e-8))
-    return {
-        'r2_embb': r2[0].item(),
-        'r2_urllc': r2[1].item(),
-        'r2_mmtc': r2[2].item(),
-        'r2_overall': r2.mean().item()
-    }
-
-
-def calculate_smape(predictions, targets):
-    """
-    Symmetric Mean Absolute Percentage Error
-    More robust than MAPE for bandwidth allocation
-    Range: 0-200% (lower is better)
-    
-    Interpretation:
-    - SMAPE < 10%: Excellent
-    - SMAPE < 20%: Good
-    - SMAPE < 30%: Acceptable
-    - SMAPE > 30%: Poor
-    """
-    numerator = torch.abs(predictions - targets)
-    denominator = (torch.abs(predictions) + torch.abs(targets)) / 2
-    smape = (numerator / (denominator + 1e-8) * 100).mean(dim=0)
-    
-    return {
-        'smape_embb': smape[0].item(),
-        'smape_urllc': smape[1].item(),
-        'smape_mmtc': smape[2].item(),
-        'smape_overall': smape.mean().item()
-    }
-
-
-def calculate_max_error(predictions, targets):
-    """
-    Maximum Absolute Error per slice
-    Identifies worst-case prediction errors
-    """
-    max_err = torch.abs(predictions - targets).max(dim=0)[0]
-    return {
-        'max_error_embb': max_err[0].item(),
-        'max_error_urllc': max_err[1].item(),
-        'max_error_mmtc': max_err[2].item(),
-        'max_error_overall': max_err.mean().item()
-    }
-
-
-def calculate_allocation_accuracy(predictions, targets, tolerance=0.1):
-    """
-    Allocation Accuracy: % of predictions within tolerance of target
+    Calculate loss for each slice independently
+    CRITICAL for debugging: Shows which slices are failing
     
     Args:
-        tolerance: Acceptable error margin (default 10% = 0.1)
+        predictions: (N, 3) tensor
+        targets: (N, 3) tensor
+        loss_fn: torch.nn loss function (MSELoss or L1Loss)
     
     Returns:
-        Percentage of predictions within tolerance
+        dict: Individual slice losses
     """
-    relative_error = torch.abs((predictions - targets) / (targets + 1e-8))
-    within_tolerance = (relative_error <= tolerance).float().mean(dim=0) * 100
+    losses = {}
+    for i, slice_name in enumerate(['embb', 'urllc', 'mmtc']):
+        slice_loss = loss_fn(predictions[:, i], targets[:, i])
+        losses[f'loss_{slice_name}'] = slice_loss.item()
     
-    return {
-        'accuracy_10pct_embb': within_tolerance[0].item(),
-        'accuracy_10pct_urllc': within_tolerance[1].item(),
-        'accuracy_10pct_mmtc': within_tolerance[2].item(),
-        'accuracy_10pct_overall': within_tolerance.mean().item()
-    }
+    # Overall loss (mean of slices)
+    losses['loss_overall'] = sum(losses.values()) / 3
+    
+    return losses
 
 
-def evaluate_model(model, dataloader, device, target_scaler=None):
+def evaluate_model(model, dataloader, device, target_scaler=None, loss_fn=None):
     """
-    Comprehensive evaluation with all metrics
+    Comprehensive evaluation with ESSENTIAL metrics only
     
     Args:
         model: PyTorch model
         dataloader: DataLoader for evaluation
         device: torch.device (cuda/cpu)
-        target_scaler: If provided, denormalize predictions for interpretable metrics
+        target_scaler: If provided, denormalize for interpretable metrics
+        loss_fn: Loss function to compute per-slice losses (optional)
     
     Returns:
-        dict: All evaluation metrics
+        dict: Essential evaluation metrics (RMSE, R², MAE, per-slice losses)
     """
     model.eval()
     all_predictions = []
@@ -214,73 +151,115 @@ def evaluate_model(model, dataloader, device, target_scaler=None):
     all_predictions = torch.cat(all_predictions, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
     
+    # Calculate per-slice loss in NORMALIZED space (before denormalization)
+    metrics = {}
+    if loss_fn is not None:
+        metrics.update(get_per_slice_loss(all_predictions, all_targets, loss_fn))
+    
     # Denormalize if scaler provided (for interpretable metrics in Mbps)
     if target_scaler is not None:
         all_predictions, all_targets = denormalize_predictions(
             all_predictions, all_targets, target_scaler
         )
     
-    # Calculate all metrics
-    metrics = {}
-    metrics.update(calculate_mae(all_predictions, all_targets))
+    # Calculate essential metrics in Mbps space
     metrics.update(calculate_rmse(all_predictions, all_targets))
-    metrics.update(calculate_nrmse(all_predictions, all_targets))
     metrics.update(calculate_r2_score(all_predictions, all_targets))
-    metrics.update(calculate_smape(all_predictions, all_targets))
-    metrics.update(calculate_max_error(all_predictions, all_targets))
-    metrics.update(calculate_allocation_accuracy(all_predictions, all_targets, tolerance=0.10))
+    metrics.update(calculate_mae(all_predictions, all_targets))
     
     return metrics
 
 
-def print_metrics(metrics, title="Evaluation Metrics"):
-    """Pretty print metrics in organized table format"""
-    print("\n" + "=" * 90)
-    print(f"{title:^90}")
-    print("=" * 90)
+def print_metrics(metrics, title="Evaluation Metrics", show_loss=False):
+    """
+    Clean, focused metric printing
+    Focus: R² (model quality) and RMSE (error magnitude)
+    """
+    print("\n" + "=" * 80)
+    print(f"{title:^80}")
+    print("=" * 80)
     
-    # Primary metrics table
-    print("\nPrimary Metrics (in Mbps):")
-    print("-" * 90)
-    print(f"{'Metric':<20} {'eMBB':>15} {'URLLC':>15} {'mMTC':>15} {'Overall':>15}")
-    print("-" * 90)
+    # Per-slice loss (if available) - Shows optimization behavior
+    if show_loss and 'loss_embb' in metrics:
+        print("\nPer-Slice Loss (Normalized Space):")
+        print("-" * 80)
+        print(f"  eMBB:    {metrics['loss_embb']:.4f}")
+        print(f"  URLLC:   {metrics['loss_urllc']:.4f}")
+        print(f"  mMTC:    {metrics['loss_mmtc']:.4f}")
+        print(f"  Overall: {metrics['loss_overall']:.4f}")
     
-    print(f"{'MAE':<20} {metrics['mae_embb']:>15.2f} {metrics['mae_urllc']:>15.2f} "
-          f"{metrics['mae_mmtc']:>15.2f} {metrics['mae_overall']:>15.2f}")
+    # Primary metrics: R² and RMSE
+    print("\nPrimary Metrics:")
+    print("-" * 80)
+    print(f"{'Metric':<15} {'eMBB':>12} {'URLLC':>12} {'mMTC':>12} {'Overall':>12}")
+    print("-" * 80)
     
-    print(f"{'RMSE':<20} {metrics['rmse_embb']:>15.2f} {metrics['rmse_urllc']:>15.2f} "
-          f"{metrics['rmse_mmtc']:>15.2f} {metrics['rmse_overall']:>15.2f}")
+    print(f"{'R² Score':<15} "
+          f"{metrics['r2_embb']:>12.4f} "
+          f"{metrics['r2_urllc']:>12.4f} "
+          f"{metrics['r2_mmtc']:>12.4f} "
+          f"{metrics['r2_overall']:>12.4f}")
     
-    print(f"{'Max Error':<20} {metrics['max_error_embb']:>15.2f} {metrics['max_error_urllc']:>15.2f} "
-          f"{metrics['max_error_mmtc']:>15.2f} {metrics['max_error_overall']:>15.2f}")
+    print(f"{'RMSE (Mbps)':<15} "
+          f"{metrics['rmse_embb']:>12.2f} "
+          f"{metrics['rmse_urllc']:>12.2f} "
+          f"{metrics['rmse_mmtc']:>12.2f} "
+          f"{metrics['rmse_overall']:>12.2f}")
     
-    # Normalized/percentage metrics
-    print("\nNormalized Metrics (%):")
-    print("-" * 90)
-    print(f"{'Metric':<20} {'eMBB':>15} {'URLLC':>15} {'mMTC':>15} {'Overall':>15}")
-    print("-" * 90)
+    print(f"{'MAE (Mbps)':<15} "
+          f"{metrics['mae_embb']:>12.2f} "
+          f"{metrics['mae_urllc']:>12.2f} "
+          f"{metrics['mae_mmtc']:>12.2f} "
+          f"{metrics['mae_overall']:>12.2f}")
     
-    print(f"{'NRMSE (%)':<20} {metrics['nrmse_embb']:>15.2f} {metrics['nrmse_urllc']:>15.2f} "
-          f"{metrics['nrmse_mmtc']:>15.2f} {metrics['nrmse_overall']:>15.2f}")
+    # Interpretation
+    print("\n" + "=" * 80)
+    print("Interpretation:")
+    print("-" * 80)
     
-    print(f"{'SMAPE (%)':<20} {metrics['smape_embb']:>15.2f} {metrics['smape_urllc']:>15.2f} "
-          f"{metrics['smape_mmtc']:>15.2f} {metrics['smape_overall']:>15.2f}")
+    r2_overall = metrics['r2_overall']
+    rmse_overall = metrics['rmse_overall']
     
-    print(f"{'Accuracy@10% (%)':<20} {metrics['accuracy_10pct_embb']:>15.2f} {metrics['accuracy_10pct_urllc']:>15.2f} "
-          f"{metrics['accuracy_10pct_mmtc']:>15.2f} {metrics['accuracy_10pct_overall']:>15.2f}")
+    # R² interpretation
+    if r2_overall >= 0.8:
+        r2_status = "✓ EXCELLENT"
+    elif r2_overall >= 0.6:
+        r2_status = "✓ GOOD"
+    elif r2_overall >= 0.4:
+        r2_status = "⚠ MODERATE"
+    elif r2_overall >= 0.0:
+        r2_status = "✗ POOR"
+    else:
+        r2_status = "✗✗ FAILURE (worse than mean baseline)"
     
-    # R² Score (most important)
-    print("\nModel Performance (R² Score):")
-    print("-" * 90)
-    print(f"{'R² Score':<20} {metrics['r2_embb']:>15.4f} {metrics['r2_urllc']:>15.4f} "
-          f"{metrics['r2_mmtc']:>15.4f} {metrics['r2_overall']:>15.4f}")
+    print(f"  R² Score:  {r2_overall:.4f} → {r2_status}")
+    print(f"  RMSE:      {rmse_overall:.2f} Mbps (lower is better)")
     
-    # Interpretation guide
-    print("\n" + "=" * 90)
-    print("Interpretation Guide:")
-    print("-" * 90)
-    print("R² Score:        0.80-0.95 = Excellent | 0.60-0.80 = Good | <0.60 = Needs Improvement")
-    print("NRMSE:           <15% = Excellent | <25% = Good | <35% = Acceptable")
-    print("SMAPE:           <15% = Excellent | <25% = Good | <35% = Acceptable")
-    print("Accuracy@10%:    >85% = Excellent | >70% = Good | >60% = Acceptable")
-    print("=" * 90 + "\n")
+    # Flag problematic slices
+    problem_slices = []
+    if metrics['r2_embb'] < 0.4:
+        problem_slices.append('eMBB')
+    if metrics['r2_urllc'] < 0.4:
+        problem_slices.append('URLLC')
+    if metrics['r2_mmtc'] < 0.4:
+        problem_slices.append('mMTC')
+    
+    if problem_slices:
+        print(f"\n⚠ WARNING: Poor R² for slices: {', '.join(problem_slices)}")
+    
+    print("=" * 80 + "\n")
+
+
+def print_training_metrics(epoch, train_loss, val_loss, train_metrics, val_metrics, lr):
+    """
+    Compact training progress display
+    Shows: Loss, R², RMSE for quick monitoring
+    """
+    print(f"\nEpoch [{epoch}] Summary:")
+    print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {lr:.6f}")
+    print(f"  Train R²: {train_metrics['r2_overall']:.4f} | Val R²: {val_metrics['r2_overall']:.4f}")
+    print(f"  Train RMSE: {train_metrics['rmse_overall']:.2f} | Val RMSE: {val_metrics['rmse_overall']:.2f}")
+    
+    # Flag if validation is getting worse
+    if val_metrics['r2_overall'] < train_metrics['r2_overall'] - 0.1:
+        print("  ⚠ Warning: Overfitting detected (Val R² << Train R²)")

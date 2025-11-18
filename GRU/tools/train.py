@@ -1,6 +1,6 @@
 """
 Training script for 6G Bandwidth Allocation GRU Model
-MMAction2-style training logs with comprehensive metrics
+FIXED VERSION - Proper loss tracking and model integration
 """
 
 import sys
@@ -12,14 +12,13 @@ import torch.optim as optim
 import numpy as np
 import os
 import time
-from datetime import datetime
 from tqdm import tqdm
 
 from config import config
 from data.dataloader import get_dataloaders
 from models.gru_model import BandwidthAllocationGRU
 from utils.helpers import save_checkpoint, count_parameters
-from utils.metrics import evaluate_model, print_metrics
+from utils.metrics import evaluate_model, print_metrics, print_training_metrics
 
 
 class AverageMeter:
@@ -63,51 +62,70 @@ class EarlyStopping:
         return self.early_stop
 
 
-def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, num_epochs):
+def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, num_epochs, track_per_slice=False):
     """
-    Train model for one epoch with MMAction2-style logging
+    Train model for one epoch
     
     Returns:
         float: Average training loss
+        dict: Per-slice losses (if tracking enabled)
     """
     model.train()
     loss_meter = AverageMeter()
     
-    # Progress bar
+    # Per-slice loss tracking
+    if track_per_slice:
+        slice_loss_meters = {
+            'embb': AverageMeter(),
+            'urllc': AverageMeter(),
+            'mmtc': AverageMeter()
+        }
+    
     pbar = tqdm(train_loader, desc=f'Epoch [{epoch}/{num_epochs}] Train', 
                 ncols=120, ascii=True)
     
     for batch_idx, (X_batch, y_batch) in enumerate(pbar):
-        # Move data to device
         X_batch = X_batch.to(device)
         y_batch = y_batch.to(device)
         
-        # Forward pass
         optimizer.zero_grad()
         predictions = model(X_batch)
         loss = criterion(predictions, y_batch)
         
-        # Backward pass with gradient clipping
+        # Track per-slice losses before backward pass
+        if track_per_slice:
+            with torch.no_grad():
+                slice_losses = ((predictions - y_batch) ** 2).mean(dim=0)
+                slice_loss_meters['embb'].update(slice_losses[0].item(), X_batch.size(0))
+                slice_loss_meters['urllc'].update(slice_losses[1].item(), X_batch.size(0))
+                slice_loss_meters['mmtc'].update(slice_losses[2].item(), X_batch.size(0))
+        
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.GRADIENT_CLIP_NORM)
         optimizer.step()
         
-        # Update metrics
         loss_meter.update(loss.item(), X_batch.size(0))
         
-        # Update progress bar
         pbar.set_postfix({
             'loss': f'{loss_meter.val:.4f}',
             'avg_loss': f'{loss_meter.avg:.4f}',
             'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
         })
     
-    return loss_meter.avg
+    if track_per_slice:
+        per_slice_losses = {
+            'embb': slice_loss_meters['embb'].avg,
+            'urllc': slice_loss_meters['urllc'].avg,
+            'mmtc': slice_loss_meters['mmtc'].avg
+        }
+        return loss_meter.avg, per_slice_losses
+    else:
+        return loss_meter.avg, None
 
 
 def validate(model, val_loader, criterion, device, epoch, num_epochs):
     """
-    Validate model with MMAction2-style logging
+    Validate model
     
     Returns:
         float: Average validation loss
@@ -115,7 +133,6 @@ def validate(model, val_loader, criterion, device, epoch, num_epochs):
     model.eval()
     loss_meter = AverageMeter()
     
-    # Progress bar
     pbar = tqdm(val_loader, desc=f'Epoch [{epoch}/{num_epochs}] Val  ', 
                 ncols=120, ascii=True)
     
@@ -127,10 +144,8 @@ def validate(model, val_loader, criterion, device, epoch, num_epochs):
             predictions = model(X_batch)
             loss = criterion(predictions, y_batch)
             
-            # Update metrics
             loss_meter.update(loss.item(), X_batch.size(0))
             
-            # Update progress bar
             pbar.set_postfix({
                 'loss': f'{loss_meter.val:.4f}',
                 'avg_loss': f'{loss_meter.avg:.4f}'
@@ -143,12 +158,11 @@ def main():
     """
     Main training function
     """
-    # Print header
     print("\n" + "=" * 80)
     print(" " * 20 + "6G BANDWIDTH ALLOCATION GRU TRAINING")
     print("=" * 80)
     
-    # Set random seed for reproducibility
+    # Set random seed
     torch.manual_seed(config.RANDOM_SEED)
     np.random.seed(config.RANDOM_SEED)
     if torch.cuda.is_available():
@@ -156,48 +170,66 @@ def main():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
     
-    # Create dataloaders with target scaler
+    # Create dataloaders
     train_loader, val_loader, test_loader, target_scaler = get_dataloaders(config)
     
     # Initialize model
     print("\n" + "-" * 80)
     print("MODEL INITIALIZATION")
     print("-" * 80)
-    model = BandwidthAllocationGRU(
-        input_size=config.INPUT_SIZE,
-        hidden_size_1=config.HIDDEN_SIZE_1,
-        hidden_size_2=config.HIDDEN_SIZE_2,
-        dense_size=config.DENSE_SIZE,
-        output_size=config.OUTPUT_SIZE,
-        dropout=config.DROPOUT
-    )
+    
+    # Check if 3-layer model is configured
+    has_third_layer = hasattr(config, 'HIDDEN_SIZE_3')
+    
+    if has_third_layer:
+        model = BandwidthAllocationGRU(
+            input_size=config.INPUT_SIZE,
+            hidden_size_1=config.HIDDEN_SIZE_1,
+            hidden_size_2=config.HIDDEN_SIZE_2,
+            hidden_size_3=config.HIDDEN_SIZE_3,
+            dense_size=config.DENSE_SIZE,
+            output_size=config.OUTPUT_SIZE,
+            dropout=config.DROPOUT
+        )
+    else:
+        model = BandwidthAllocationGRU(
+            input_size=config.INPUT_SIZE,
+            hidden_size_1=config.HIDDEN_SIZE_1,
+            hidden_size_2=config.HIDDEN_SIZE_2,
+            dense_size=config.DENSE_SIZE,
+            output_size=config.OUTPUT_SIZE,
+            dropout=config.DROPOUT
+        )
+    
     model = model.to(config.DEVICE)
     
-    # Print model info
     num_params = count_parameters(model)
     print(f"Model: BandwidthAllocationGRU")
-    print(f"Architecture: Input({config.INPUT_SIZE}) -> GRU({config.HIDDEN_SIZE_1}) -> "
-          f"GRU({config.HIDDEN_SIZE_2}) -> Dense({config.DENSE_SIZE}) -> Output({config.OUTPUT_SIZE})")
     print(f"Total params: {num_params:,}")
     print(f"Device: {config.DEVICE}")
     
-    # Define loss function with weights for URLLC priority
-    criterion = nn.MSELoss(reduction='none')
+    # Define loss function
+    if hasattr(config, 'USE_MAE_LOSS') and config.USE_MAE_LOSS:
+        criterion_base = nn.L1Loss(reduction='none')
+        loss_name = "MAE"
+    else:
+        criterion_base = nn.MSELoss(reduction='none')
+        loss_name = "MSE"
     
-    def weighted_mse_loss(predictions, targets):
-        """Custom weighted MSE loss"""
-        losses = criterion(predictions, targets)  # (batch, 3)
+    def weighted_loss(predictions, targets):
+        """Weighted loss with equal or custom weights"""
+        losses = criterion_base(predictions, targets)
         weighted_losses = losses * config.LOSS_WEIGHTS
         return weighted_losses.mean()
     
-    # Define optimizer with weight decay
+    # Optimizer
     optimizer = optim.AdamW(
         model.parameters(), 
         lr=config.LEARNING_RATE,
         weight_decay=config.WEIGHT_DECAY
     )
     
-    # Learning rate scheduler
+    # LR Scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 
         mode='min', 
@@ -219,35 +251,28 @@ def main():
     val_losses = []
     learning_rates = []
     
+    # Check if per-slice tracking is enabled
+    track_per_slice = hasattr(config, 'TRACK_PER_SLICE_LOSS') and config.TRACK_PER_SLICE_LOSS
+    
     print("\n" + "-" * 80)
     print("TRAINING CONFIGURATION")
     print("-" * 80)
     print(f"Epochs: {config.NUM_EPOCHS}")
     print(f"Batch size: {config.BATCH_SIZE}")
     print(f"Learning rate: {config.LEARNING_RATE}")
-    print(f"Optimizer: AdamW")
-    print(f"Weight decay: {config.WEIGHT_DECAY}")
-    print(f"Loss function: Weighted MSE")
-    print(f"  - eMBB weight: {config.LOSS_WEIGHTS[0].item():.1f}")
-    print(f"  - URLLC weight: {config.LOSS_WEIGHTS[1].item():.1f} (prioritized)")
-    print(f"  - mMTC weight: {config.LOSS_WEIGHTS[2].item():.1f}")
-    print(f"LR scheduler: ReduceLROnPlateau")
-    print(f"  - Factor: {config.LR_SCHEDULER_FACTOR}")
-    print(f"  - Patience: {config.LR_SCHEDULER_PATIENCE}")
-    print(f"  - Min LR: {config.MIN_LR}")
-    print(f"Gradient clipping: max_norm={config.GRADIENT_CLIP_NORM}")
+    print(f"Optimizer: AdamW (weight_decay={config.WEIGHT_DECAY})")
+    print(f"Loss function: Weighted {loss_name}")
+    print(f"  Weights: {config.LOSS_WEIGHTS.cpu().numpy()}")
+    print(f"Gradient clipping: {config.GRADIENT_CLIP_NORM}")
     print(f"Early stopping: patience={config.EARLY_STOPPING_PATIENCE}")
-    print(f"Random seed: {config.RANDOM_SEED}")
+    print(f"Per-slice tracking: {track_per_slice}")
     
     print("\n" + "-" * 80)
     print("DATASET INFORMATION")
     print("-" * 80)
-    print(f"Train samples: {len(train_loader.dataset):,}")
-    print(f"Val samples: {len(val_loader.dataset):,}")
-    print(f"Test samples: {len(test_loader.dataset):,}")
-    print(f"Train batches: {len(train_loader)}")
-    print(f"Val batches: {len(val_loader)}")
-    print(f"Test batches: {len(test_loader)}")
+    print(f"Train: {len(train_loader.dataset):,} samples, {len(train_loader)} batches")
+    print(f"Val:   {len(val_loader.dataset):,} samples, {len(val_loader)} batches")
+    print(f"Test:  {len(test_loader.dataset):,} samples, {len(test_loader)} batches")
     
     print("\n" + "=" * 80)
     print("STARTING TRAINING")
@@ -260,71 +285,72 @@ def main():
         epoch_start_time = time.time()
         
         # Train
-        train_loss = train_one_epoch(model, train_loader, weighted_mse_loss, 
-                                     optimizer, config.DEVICE, epoch, config.NUM_EPOCHS)
+        train_loss, per_slice_losses = train_one_epoch(
+            model, train_loader, weighted_loss, optimizer, 
+            config.DEVICE, epoch, config.NUM_EPOCHS, track_per_slice
+        )
         
         # Validate
-        val_loss = validate(model, val_loader, weighted_mse_loss, 
+        val_loss = validate(model, val_loader, weighted_loss, 
                            config.DEVICE, epoch, config.NUM_EPOCHS)
         
-        # Update learning rate
+        # Update LR
         old_lr = optimizer.param_groups[0]['lr']
         scheduler.step(val_loss)
         new_lr = optimizer.param_groups[0]['lr']
         
-        # Log losses and learning rate
+        # Log
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         learning_rates.append(new_lr)
         
-        # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
         
-        # Print epoch summary
+        # Print summary
         print(f"\nEpoch [{epoch}/{config.NUM_EPOCHS}] Summary:")
         print(f"  train_loss: {train_loss:.4f} | val_loss: {val_loss:.4f} | "
               f"lr: {new_lr:.6f} | time: {epoch_time:.2f}s")
         
-        # LR reduction message
+        # Per-slice loss tracking
+        if track_per_slice and per_slice_losses:
+            print(f"  Per-slice train loss: eMBB={per_slice_losses['embb']:.4f}, "
+                  f"URLLC={per_slice_losses['urllc']:.4f}, mMTC={per_slice_losses['mmtc']:.4f}")
+        
         if new_lr < old_lr:
             print(f"  >> Learning rate reduced: {old_lr:.6f} -> {new_lr:.6f}")
         
         # Save best model
-        is_best = val_loss < best_val_loss
-        if is_best:
+        if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_epoch = epoch
             best_model_path = os.path.join(config.MODEL_SAVE_DIR, config.MODEL_NAME)
-            save_checkpoint(model, optimizer, epoch, train_loss, val_loss, 
-                          best_model_path)
+            save_checkpoint(model, optimizer, epoch, train_loss, val_loss, best_model_path)
             print(f"  >> Best model saved! (val_loss: {val_loss:.4f})")
         
-        # Check early stopping
+        # Early stopping
         if early_stopping(val_loss):
             print(f"\n  >> Early stopping triggered after {epoch} epochs")
             print(f"  >> Best epoch was {best_epoch} with val_loss: {best_val_loss:.4f}")
             break
         
-        # Evaluate with all metrics at specified intervals
+        # Detailed evaluation
         if epoch % config.LOG_INTERVAL == 0 or epoch == config.NUM_EPOCHS:
             print("\n" + "-" * 80)
             print(f"DETAILED EVALUATION - Epoch [{epoch}/{config.NUM_EPOCHS}]")
             print("-" * 80)
             
-            # Evaluate on validation set with denormalization
-            val_metrics = evaluate_model(model, val_loader, config.DEVICE, target_scaler)
-            print_metrics(val_metrics, title="Validation Set Metrics")
+            val_metrics = evaluate_model(model, val_loader, config.DEVICE, target_scaler, criterion_base)
+            print_metrics(val_metrics, title="Validation Set Metrics", show_loss=track_per_slice)
         
         print("-" * 80)
     
     total_time = time.time() - start_time
     
-    # Save final checkpoint
+    # Save final model
     final_checkpoint_path = os.path.join(config.MODEL_SAVE_DIR, config.FINAL_MODEL_NAME)
-    save_checkpoint(model, optimizer, epoch, train_losses[-1], val_losses[-1], 
-                    final_checkpoint_path)
+    save_checkpoint(model, optimizer, epoch, train_losses[-1], val_losses[-1], final_checkpoint_path)
     
-    # Save training history
+    # Save history
     history = {
         'train_losses': train_losses,
         'val_losses': val_losses,
@@ -334,60 +360,49 @@ def main():
     }
     history_path = os.path.join(config.MODEL_SAVE_DIR, "training_history.npy")
     np.save(history_path, history)
-    print(f"\nTraining history saved: {history_path}")
     
     # Final summary
     print("\n" + "=" * 80)
     print(" " * 30 + "TRAINING COMPLETED")
     print("=" * 80)
-    print(f"Total training time: {total_time/3600:.2f} hours ({total_time/60:.2f} minutes)")
+    print(f"Total time: {total_time/3600:.2f} hours ({total_time/60:.2f} minutes)")
     print(f"Total epochs: {epoch}")
     print(f"Best epoch: {best_epoch}")
-    print(f"Best validation loss: {best_val_loss:.4f}")
-    print(f"Final train loss: {train_losses[-1]:.4f}")
-    print(f"Final val loss: {val_losses[-1]:.4f}")
+    print(f"Best val loss: {best_val_loss:.4f}")
     
-    # Final evaluation on all splits
+    # Final evaluation
     print("\n" + "=" * 80)
     print("FINAL EVALUATION ON ALL SPLITS")
     print("=" * 80)
     
-    # Load best model
     checkpoint = torch.load(os.path.join(config.MODEL_SAVE_DIR, config.MODEL_NAME))
     model.load_state_dict(checkpoint['model_state_dict'])
-    print(f"\nLoaded best model from epoch {best_epoch}")
     
-    # Evaluate on all splits (with denormalization for interpretable metrics)
     print("\n>>> TRAINING SET:")
-    train_metrics = evaluate_model(model, train_loader, config.DEVICE, target_scaler)
-    print_metrics(train_metrics, title="Training Set - Final Metrics")
+    train_metrics = evaluate_model(model, train_loader, config.DEVICE, target_scaler, criterion_base)
+    print_metrics(train_metrics, title="Training Set - Final Metrics", show_loss=True)
     
     print("\n>>> VALIDATION SET:")
-    val_metrics = evaluate_model(model, val_loader, config.DEVICE, target_scaler)
-    print_metrics(val_metrics, title="Validation Set - Final Metrics")
+    val_metrics = evaluate_model(model, val_loader, config.DEVICE, target_scaler, criterion_base)
+    print_metrics(val_metrics, title="Validation Set - Final Metrics", show_loss=True)
     
     print("\n>>> TEST SET:")
-    test_metrics = evaluate_model(model, test_loader, config.DEVICE, target_scaler)
-    print_metrics(test_metrics, title="Test Set - Final Metrics")
+    test_metrics = evaluate_model(model, test_loader, config.DEVICE, target_scaler, criterion_base)
+    print_metrics(test_metrics, title="Test Set - Final Metrics", show_loss=True)
     
-    # Print final summary
     print("\n" + "=" * 80)
     print("SAVED MODELS:")
     print("-" * 80)
-    print(f"Best model:      {os.path.join(config.MODEL_SAVE_DIR, config.MODEL_NAME)}")
-    print(f"Final model:     {final_checkpoint_path}")
-    print(f"Training history: {history_path}")
-    print("=" * 80)
+    print(f"Best model:  {os.path.join(config.MODEL_SAVE_DIR, config.MODEL_NAME)}")
+    print(f"Final model: {final_checkpoint_path}")
+    print(f"History:     {history_path}")
     
-    # Print key metrics summary
     print("\n" + "=" * 80)
-    print("KEY PERFORMANCE METRICS (Test Set)")
+    print("KEY METRICS (Test Set)")
     print("=" * 80)
-    print(f"R2 Score:        {test_metrics['r2_overall']:.4f}")
-    print(f"NRMSE:           {test_metrics['nrmse_overall']:.2f}%")
-    print(f"MAE (Mbps):      {test_metrics['mae_overall']:.2f}")
-    print(f"RMSE (Mbps):     {test_metrics['rmse_overall']:.2f}")
-    print(f"Accuracy@10%:    {test_metrics['accuracy_10pct_overall']:.2f}%")
+    print(f"R² Score:    {test_metrics['r2_overall']:.4f}")
+    print(f"RMSE (Mbps): {test_metrics['rmse_overall']:.2f}")
+    print(f"MAE (Mbps):  {test_metrics['mae_overall']:.2f}")
     print("=" * 80 + "\n")
 
 
