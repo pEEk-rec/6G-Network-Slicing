@@ -11,6 +11,9 @@ __pycache__/
 # VSCode settings
 .vscode/
 
+*.pth
+*.pt
+checkpoints/
 # Dataset folders (if large)
 Dataset/
 *.csv
