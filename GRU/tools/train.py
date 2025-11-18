@@ -40,6 +40,29 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 
+class EarlyStopping:
+    """Early stopping to prevent overfitting"""
+    def __init__(self, patience=15, min_delta=1e-4):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+    
+    def __call__(self, val_loss):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_loss = val_loss
+            self.counter = 0
+        
+        return self.early_stop
+
+
 def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, num_epochs):
     """
     Train model for one epoch with MMAction2-style logging
@@ -66,7 +89,7 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, nu
         
         # Backward pass with gradient clipping
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.GRADIENT_CLIP_NORM)
         optimizer.step()
         
         # Update metrics
@@ -130,6 +153,8 @@ def main():
     np.random.seed(config.RANDOM_SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(config.RANDOM_SEED)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     
     # Create dataloaders with target scaler
     train_loader, val_loader, test_loader, target_scaler = get_dataloaders(config)
@@ -165,17 +190,26 @@ def main():
         weighted_losses = losses * config.LOSS_WEIGHTS
         return weighted_losses.mean()
     
-    # Define optimizer
+    # Define optimizer with weight decay
     optimizer = optim.AdamW(
-    model.parameters(), 
-    lr=config.LEARNING_RATE,
-    weight_decay=1e-4  # L2 regularization
-)
-
+        model.parameters(), 
+        lr=config.LEARNING_RATE,
+        weight_decay=config.WEIGHT_DECAY
+    )
     
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5
+        optimizer, 
+        mode='min', 
+        factor=config.LR_SCHEDULER_FACTOR, 
+        patience=config.LR_SCHEDULER_PATIENCE,
+        min_lr=config.MIN_LR
+    )
+    
+    # Early stopping
+    early_stopping = EarlyStopping(
+        patience=config.EARLY_STOPPING_PATIENCE,
+        min_delta=config.EARLY_STOPPING_MIN_DELTA
     )
     
     # Training tracking
@@ -183,6 +217,7 @@ def main():
     best_epoch = 0
     train_losses = []
     val_losses = []
+    learning_rates = []
     
     print("\n" + "-" * 80)
     print("TRAINING CONFIGURATION")
@@ -190,13 +225,18 @@ def main():
     print(f"Epochs: {config.NUM_EPOCHS}")
     print(f"Batch size: {config.BATCH_SIZE}")
     print(f"Learning rate: {config.LEARNING_RATE}")
-    print(f"Optimizer: Adam")
+    print(f"Optimizer: AdamW")
+    print(f"Weight decay: {config.WEIGHT_DECAY}")
     print(f"Loss function: Weighted MSE")
     print(f"  - eMBB weight: {config.LOSS_WEIGHTS[0].item():.1f}")
     print(f"  - URLLC weight: {config.LOSS_WEIGHTS[1].item():.1f} (prioritized)")
     print(f"  - mMTC weight: {config.LOSS_WEIGHTS[2].item():.1f}")
-    print(f"LR scheduler: ReduceLROnPlateau (factor=0.5, patience=5)")
-    print(f"Gradient clipping: max_norm=1.0")
+    print(f"LR scheduler: ReduceLROnPlateau")
+    print(f"  - Factor: {config.LR_SCHEDULER_FACTOR}")
+    print(f"  - Patience: {config.LR_SCHEDULER_PATIENCE}")
+    print(f"  - Min LR: {config.MIN_LR}")
+    print(f"Gradient clipping: max_norm={config.GRADIENT_CLIP_NORM}")
+    print(f"Early stopping: patience={config.EARLY_STOPPING_PATIENCE}")
     print(f"Random seed: {config.RANDOM_SEED}")
     
     print("\n" + "-" * 80)
@@ -232,9 +272,10 @@ def main():
         scheduler.step(val_loss)
         new_lr = optimizer.param_groups[0]['lr']
         
-        # Log losses
+        # Log losses and learning rate
         train_losses.append(train_loss)
         val_losses.append(val_loss)
+        learning_rates.append(new_lr)
         
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
@@ -258,8 +299,14 @@ def main():
                           best_model_path)
             print(f"  >> Best model saved! (val_loss: {val_loss:.4f})")
         
-        # Evaluate with all metrics every 5 epochs (with denormalization)
-        if epoch % 5 == 0 or epoch == config.NUM_EPOCHS:
+        # Check early stopping
+        if early_stopping(val_loss):
+            print(f"\n  >> Early stopping triggered after {epoch} epochs")
+            print(f"  >> Best epoch was {best_epoch} with val_loss: {best_val_loss:.4f}")
+            break
+        
+        # Evaluate with all metrics at specified intervals
+        if epoch % config.LOG_INTERVAL == 0 or epoch == config.NUM_EPOCHS:
             print("\n" + "-" * 80)
             print(f"DETAILED EVALUATION - Epoch [{epoch}/{config.NUM_EPOCHS}]")
             print("-" * 80)
@@ -273,15 +320,28 @@ def main():
     total_time = time.time() - start_time
     
     # Save final checkpoint
-    final_checkpoint_path = os.path.join(config.MODEL_SAVE_DIR, "final_model.pth")
-    save_checkpoint(model, optimizer, config.NUM_EPOCHS, train_losses[-1], val_losses[-1], 
+    final_checkpoint_path = os.path.join(config.MODEL_SAVE_DIR, config.FINAL_MODEL_NAME)
+    save_checkpoint(model, optimizer, epoch, train_losses[-1], val_losses[-1], 
                     final_checkpoint_path)
+    
+    # Save training history
+    history = {
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'learning_rates': learning_rates,
+        'best_epoch': best_epoch,
+        'best_val_loss': best_val_loss
+    }
+    history_path = os.path.join(config.MODEL_SAVE_DIR, "training_history.npy")
+    np.save(history_path, history)
+    print(f"\nTraining history saved: {history_path}")
     
     # Final summary
     print("\n" + "=" * 80)
     print(" " * 30 + "TRAINING COMPLETED")
     print("=" * 80)
     print(f"Total training time: {total_time/3600:.2f} hours ({total_time/60:.2f} minutes)")
+    print(f"Total epochs: {epoch}")
     print(f"Best epoch: {best_epoch}")
     print(f"Best validation loss: {best_val_loss:.4f}")
     print(f"Final train loss: {train_losses[-1]:.4f}")
@@ -295,6 +355,7 @@ def main():
     # Load best model
     checkpoint = torch.load(os.path.join(config.MODEL_SAVE_DIR, config.MODEL_NAME))
     model.load_state_dict(checkpoint['model_state_dict'])
+    print(f"\nLoaded best model from epoch {best_epoch}")
     
     # Evaluate on all splits (with denormalization for interpretable metrics)
     print("\n>>> TRAINING SET:")
@@ -309,11 +370,24 @@ def main():
     test_metrics = evaluate_model(model, test_loader, config.DEVICE, target_scaler)
     print_metrics(test_metrics, title="Test Set - Final Metrics")
     
+    # Print final summary
     print("\n" + "=" * 80)
     print("SAVED MODELS:")
     print("-" * 80)
-    print(f"Best model:  {os.path.join(config.MODEL_SAVE_DIR, config.MODEL_NAME)}")
-    print(f"Final model: {final_checkpoint_path}")
+    print(f"Best model:      {os.path.join(config.MODEL_SAVE_DIR, config.MODEL_NAME)}")
+    print(f"Final model:     {final_checkpoint_path}")
+    print(f"Training history: {history_path}")
+    print("=" * 80)
+    
+    # Print key metrics summary
+    print("\n" + "=" * 80)
+    print("KEY PERFORMANCE METRICS (Test Set)")
+    print("=" * 80)
+    print(f"R2 Score:        {test_metrics['r2_overall']:.4f}")
+    print(f"NRMSE:           {test_metrics['nrmse_overall']:.2f}%")
+    print(f"MAE (Mbps):      {test_metrics['mae_overall']:.2f}")
+    print(f"RMSE (Mbps):     {test_metrics['rmse_overall']:.2f}")
+    print(f"Accuracy@10%:    {test_metrics['accuracy_10pct_overall']:.2f}%")
     print("=" * 80 + "\n")
 
 
