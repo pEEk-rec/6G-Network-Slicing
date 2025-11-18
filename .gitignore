@@ -15,7 +15,10 @@ __pycache__/
 Dataset/
 *.csv
 *.pt
+*.npy
 
 # OS files
 .DS_Store
 Thumbs.db
+
+Splits/
